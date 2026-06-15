@@ -15,7 +15,8 @@ __pycache__/
 venv/
 env/
 .env
-.env.*
+.env.local
+!.env.example
 
 # IDE 与系统文件
 .idea/

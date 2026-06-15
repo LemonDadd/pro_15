@@ -1,180 +1,489 @@
-import asyncio
 import json
 import logging
+import os
 import queue
 import threading
 import time
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 import pandas
 from tqsdk import TqApi, TqAuth
 
-from app.config import TQ_AUTH_PASSWORD, TQ_AUTH_USER, UPDATE_LOOP_DEADLINE
-from app.models import QuoteData
+from app.config import (
+    API_KEY,
+    DEFAULT_STOCK_SYMBOLS,
+    MAX_TOTAL_SUBSCRIPTIONS,
+    MAX_WS_QUEUE_SIZE,
+    PERSIST_SUBSCRIPTIONS,
+    STARTUP_TIMEOUT,
+    SUBSCRIPTIONS_FILE,
+    TQ_AUTH_PASSWORD,
+    TQ_AUTH_USER,
+    UPDATE_LOOP_DEADLINE,
+)
+from app.models import QuoteData, SymbolInfo, TickData
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class Command:
+    action: str
+    params: dict = field(default_factory=dict)
+    _event: threading.Event = field(default_factory=threading.Event, init=False)
+    _result: Any = field(default=None, init=False)
+    _error: Optional[str] = field(default=None, init=False)
+
+    def set_result(self, result: Any):
+        self._result = result
+        self._event.set()
+
+    def set_error(self, error: str):
+        self._error = error
+        self._event.set()
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        return self._event.wait(timeout=timeout)
+
+    @property
+    def result(self) -> Any:
+        return self._result
+
+    @property
+    def error(self) -> Optional[str]:
+        return self._error
+
+
 class TqMarketEngine:
+    """
+    基于 TqSdk 的行情引擎。
+
+    设计原则：
+    - 单线程 TqApi：所有 TqSdk API 调用都在 _run_loop 工作线程执行
+    - 指令队列：外部线程通过 _cmd_queue 提交请求，Event+结果槽 回传
+    - 自动重连：TqSdk 异常断线后自动重建连接并恢复订阅
+    """
+
     def __init__(self):
         self._api: Optional[TqApi] = None
         self._quotes: dict[str, object] = {}
         self._klines: dict[str, pandas.DataFrame] = {}
         self._ticks: dict[str, pandas.DataFrame] = {}
+        self._subscribed_symbols: set[str] = set()
+        self._cmd_queue: "queue.Queue[Command]" = queue.Queue()
+        self._ws_queues: list[queue.Queue] = []
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._ws_queues: list[queue.Queue] = []
-        self._subscribed_symbols: set[str] = set()
         self._startup_event = threading.Event()
+        self._last_error: Optional[str] = None
+        self._last_update_at: Optional[float] = None
+        self._consecutive_errors = 0
+        self._reconnect_delay = 0
 
-    @property
-    def api(self) -> TqApi:
-        if self._api is None:
-            raise RuntimeError("TqMarketEngine not started")
-        return self._api
+    # ---------- 公共属性 ----------
 
     @property
     def is_ready(self) -> bool:
-        return self._api is not None and self._running
+        return self._api is not None and self._running and self._last_error is None
 
-    def wait_until_ready(self, timeout: float = 10.0) -> bool:
-        return self._startup_event.wait(timeout=timeout)
+    @property
+    def last_error(self) -> Optional[str]:
+        return self._last_error
+
+    @property
+    def last_update_at(self) -> Optional[float]:
+        return self._last_update_at
+
+    def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
+        """等待引擎就绪，返回是否成功。"""
+        if timeout is None:
+            timeout = STARTUP_TIMEOUT
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.is_ready:
+                return True
+            if self._last_error in ("auth_failed", "auth_missing"):
+                return False
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            self._startup_event.wait(timeout=min(remaining, 1.0))
+        return self.is_ready
+
+    # ---------- 生命周期 ----------
 
     def start(self):
         if self._running:
             return
         self._running = True
         self._startup_event.clear()
+        self._last_error = None
+        self._consecutive_errors = 0
+        self._load_persisted_subscriptions()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         logger.info("TqMarketEngine starting...")
 
     def stop(self):
+        self._save_persisted_subscriptions()
         self._running = False
-        self._startup_event.clear()
+        self._startup_event.set()
         if self._api is not None:
             try:
                 self._api.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Error closing TqApi: %s", e)
             self._api = None
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
+        self._last_error = None
         logger.info("TqMarketEngine stopped")
 
+    # ---------- 指令队列：提交请求 ----------
+
+    def _submit(self, action: str, params: Optional[dict] = None, timeout: float = 30.0) -> Any:
+        """向工作线程提交指令并等待结果。"""
+        if not self._running:
+            raise RuntimeError("TqMarketEngine is not running")
+        cmd = Command(action=action, params=params or {})
+        self._cmd_queue.put(cmd)
+        ok = cmd.wait(timeout=timeout)
+        if not ok:
+            raise TimeoutError(f"Command '{action}' timed out")
+        if cmd.error:
+            raise RuntimeError(cmd.error)
+        return cmd.result
+
+    # ---------- 公开 API（供 HTTP/WS 调用）----------
+
+    def subscribe_quote(self, symbols: list[str]) -> tuple[list[str], list[str]]:
+        return self._submit("subscribe", {"symbols": symbols})
+
+    def unsubscribe_quote(self, symbols: list[str]) -> tuple[list[str], list[str]]:
+        return self._submit("unsubscribe", {"symbols": symbols})
+
+    def get_quote(self, symbol: str) -> Optional[QuoteData]:
+        return self._submit("get_quote", {"symbol": symbol})
+
+    def get_all_quotes(self) -> list[QuoteData]:
+        return self._submit("get_all_quotes")
+
+    def get_klines(
+        self, symbol: str, duration_seconds: int = 60, data_length: int = 200
+    ) -> Optional[pandas.DataFrame]:
+        return self._submit(
+            "get_klines",
+            {"symbol": symbol, "duration_seconds": duration_seconds, "data_length": data_length},
+        )
+
+    def get_ticks(self, symbol: str, data_length: int = 200) -> Optional[pandas.DataFrame]:
+        return self._submit(
+            "get_ticks",
+            {"symbol": symbol, "data_length": data_length},
+        )
+
+    def query_quotes(
+        self,
+        exchange_id: Optional[str] = None,
+        product_id: Optional[str] = None,
+        ins_class: Optional[str] = None,
+        expired: bool = False,
+    ) -> list[SymbolInfo]:
+        return self._submit(
+            "query_quotes",
+            {
+                "exchange_id": exchange_id,
+                "product_id": product_id,
+                "ins_class": ins_class,
+                "expired": expired,
+            },
+        )
+
+    def get_subscribed_symbols(self) -> list[str]:
+        with self._lock:
+            return list(self._subscribed_symbols)
+
+    def register_ws_queue(self) -> queue.Queue:
+        q: queue.Queue = queue.Queue(maxsize=MAX_WS_QUEUE_SIZE)
+        self._ws_queues.append(q)
+        return q
+
+    def unregister_ws_queue(self, q: queue.Queue):
+        if q in self._ws_queues:
+            self._ws_queues.remove(q)
+
+    # ---------- 工作线程主循环 ----------
+
     def _run_loop(self):
-        auth = None
-        if TQ_AUTH_USER and TQ_AUTH_PASSWORD:
-            auth = TqAuth(TQ_AUTH_USER, TQ_AUTH_PASSWORD)
-        try:
-            self._api = TqApi(auth=auth)
+        while self._running:
+            try:
+                self._connect_and_run()
+            except Exception as e:
+                self._consecutive_errors += 1
+                self._last_error = "connect_timeout" if self._consecutive_errors >= 3 else None
+                logger.error(
+                    "TqApi loop error (consecutive=%d): %s",
+                    self._consecutive_errors,
+                    e,
+                )
+                if self._running:
+                    delay = min(2 ** self._consecutive_errors, 30)
+                    self._reconnect_delay = delay
+                    logger.info("Reconnecting in %ds...", delay)
+                    time.sleep(delay)
+            finally:
+                if self._api is not None:
+                    try:
+                        self._api.close()
+                    except Exception:
+                        pass
+                    self._api = None
+
+    def _connect_and_run(self):
+        """创建 TqApi 连接并进入 wait_update 循环。"""
+        if not TQ_AUTH_USER or not TQ_AUTH_PASSWORD:
+            self._last_error = "auth_missing"
             self._startup_event.set()
-            logger.info("TqApi connected successfully")
-        except Exception as e:
-            logger.error("Failed to create TqApi: %s", e)
-            self._running = False
-            self._startup_event.set()
+            logger.error("Auth credentials missing")
+            time.sleep(5)
             return
 
+        auth = TqAuth(TQ_AUTH_USER, TQ_AUTH_PASSWORD)
         try:
+            self._api = TqApi(auth=auth)
+        except Exception as e:
+            self._last_error = "auth_failed"
+            self._startup_event.set()
+            logger.error("TqApi auth/connect failed: %s", e)
+            raise
+
+        try:
+            # 恢复订阅
+            symbols_to_subscribe = list(self._subscribed_symbols) if self._subscribed_symbols else []
+            if not symbols_to_subscribe:
+                symbols_to_subscribe = list(DEFAULT_STOCK_SYMBOLS)
+
+            for symbol in symbols_to_subscribe:
+                try:
+                    q = self._api.get_quote(symbol)
+                    self._quotes[symbol] = q
+                    self._subscribed_symbols.add(symbol)
+                except Exception as e:
+                    logger.warning("Failed to subscribe %s: %s", symbol, e)
+
+            if symbols_to_subscribe:
+                logger.info("Restored %d subscriptions", len(self._subscribed_symbols))
+
+            self._last_error = None
+            self._consecutive_errors = 0
+            self._reconnect_delay = 0
+            self._startup_event.set()
+            logger.info("TqApi connected, subscriptions: %d", len(self._subscribed_symbols))
+
+            # 主循环
             while self._running:
+                self._process_pending_commands()
                 deadline_ts = time.time() + UPDATE_LOOP_DEADLINE
                 updated = self._api.wait_update(deadline=deadline_ts)
                 if updated:
+                    self._last_update_at = time.time()
                     self._on_update()
-        except Exception as e:
-            logger.error("TqApi loop error: %s", e)
         finally:
             try:
                 self._api.close()
             except Exception:
                 pass
             self._api = None
-            self._running = False
-            self._startup_event.clear()
+
+    def _process_pending_commands(self):
+        """处理队列中等待的指令（非阻塞，每次最多处理一批）。"""
+        processed = 0
+        while processed < 20:
+            try:
+                cmd = self._cmd_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self._handle_command(cmd)
+            except Exception as e:
+                logger.error("Command '%s' failed: %s", cmd.action, e)
+                cmd.set_error(str(e))
+            processed += 1
+
+    def _handle_command(self, cmd: Command):
+        """在工作线程中执行具体指令。"""
+        if self._api is None:
+            cmd.set_error("api_not_ready")
+            return
+
+        action = cmd.action
+        params = cmd.params
+
+        if action == "subscribe":
+            symbols = params.get("symbols", [])
+            result = self._cmd_subscribe(symbols)
+            cmd.set_result(result)
+
+        elif action == "unsubscribe":
+            symbols = params.get("symbols", [])
+            result = self._cmd_unsubscribe(symbols)
+            cmd.set_result(result)
+
+        elif action == "get_quote":
+            symbol = params.get("symbol", "")
+            result = self._extract_quote(symbol)
+            cmd.set_result(result)
+
+        elif action == "get_all_quotes":
+            result = []
+            for s in list(self._quotes.keys()):
+                q = self._extract_quote(s)
+                if q:
+                    result.append(q)
+            cmd.set_result(result)
+
+        elif action == "get_klines":
+            symbol = params.get("symbol", "")
+            duration = params.get("duration_seconds", 60)
+            data_length = params.get("data_length", 200)
+            key = f"{symbol}_{duration}_{data_length}"
+            if key not in self._klines:
+                df = self._api.get_kline_serial(symbol, duration, data_length=data_length)
+                self._klines[key] = df
+            cmd.set_result(self._klines[key])
+
+        elif action == "get_ticks":
+            symbol = params.get("symbol", "")
+            data_length = params.get("data_length", 200)
+            key = f"{symbol}_{data_length}"
+            if key not in self._ticks:
+                df = self._api.get_tick_serial(symbol, data_length=data_length)
+                self._ticks[key] = df
+            cmd.set_result(self._ticks[key])
+
+        elif action == "query_quotes":
+            exchange_id = params.get("exchange_id")
+            product_id = params.get("product_id")
+            ins_class = params.get("ins_class")
+            expired = params.get("expired", False)
+            try:
+                symbols = self._api.query_quotes(
+                    ins_class=ins_class,
+                    exchange_id=exchange_id,
+                    product_id=product_id,
+                    expired=expired,
+                )
+                symbol_list = list(symbols)[:50]
+                if symbol_list:
+                    try:
+                        info_df = self._api.query_symbol_info(symbol_list)
+                        infos: list[SymbolInfo] = []
+                        for s in symbol_list:
+                            row = None
+                            if not info_df.empty and s in info_df.index:
+                                row = info_df.loc[s]
+                            infos.append(
+                                SymbolInfo(
+                                    symbol=s,
+                                    instrument_name=row.get("instrument_name") if row is not None else None,
+                                    ins_class=row.get("ins_class") if row is not None else None,
+                                    exchange_id=row.get("exchange_id") if row is not None else None,
+                                    price_tick=self._safe_float(row.get("price_tick")) if row is not None else None,
+                                    volume_multiple=self._safe_float(row.get("volume_multiple")) if row is not None else None,
+                                )
+                            )
+                        cmd.set_result(infos)
+                        return
+                    except Exception as e:
+                        logger.warning("query_symbol_info failed, falling back: %s", e)
+                infos = [SymbolInfo(symbol=s) for s in symbol_list]
+                cmd.set_result(infos)
+            except Exception as e:
+                cmd.set_error(f"query_failed: {e}")
+
+        else:
+            cmd.set_error(f"unknown_action: {action}")
+
+    def _cmd_subscribe(self, symbols: list[str]) -> tuple[list[str], list[str]]:
+        subscribed = []
+        already = []
+        for s in symbols:
+            if s in self._quotes:
+                already.append(s)
+                continue
+            if len(self._subscribed_symbols) >= MAX_TOTAL_SUBSCRIPTIONS:
+                logger.warning("Max subscriptions reached (%d)", MAX_TOTAL_SUBSCRIPTIONS)
+                break
+            try:
+                q = self._api.get_quote(s)
+                self._quotes[s] = q
+                self._subscribed_symbols.add(s)
+                subscribed.append(s)
+                logger.info("Subscribed: %s", s)
+            except Exception as e:
+                logger.error("Subscribe failed for %s: %s", s, e)
+        if subscribed:
+            self._save_persisted_subscriptions()
+        return subscribed, already
+
+    def _cmd_unsubscribe(self, symbols: list[str]) -> tuple[list[str], list[str]]:
+        unsubscribed = []
+        not_subscribed = []
+        for s in symbols:
+            if s in self._quotes:
+                del self._quotes[s]
+                self._subscribed_symbols.discard(s)
+                unsubscribed.append(s)
+                logger.info("Unsubscribed: %s", s)
+                # 清理相关缓存
+                keys_to_del = [k for k in self._klines if k.startswith(f"{s}_")]
+                for k in keys_to_del:
+                    del self._klines[k]
+                keys_to_del = [k for k in self._ticks if k.startswith(f"{s}_")]
+                for k in keys_to_del:
+                    del self._ticks[k]
+            else:
+                not_subscribed.append(s)
+        if unsubscribed:
+            self._save_persisted_subscriptions()
+        return unsubscribed, not_subscribed
+
+    # ---------- 行情更新推送 ----------
 
     def _on_update(self):
         changed_symbols = []
-        with self._lock:
-            for symbol, quote in self._quotes.items():
-                if self._api.is_changing(quote, ["last_price", "ask_price1", "bid_price1", "datetime"]):
-                    changed_symbols.append(symbol)
+        for symbol, quote in self._quotes.items():
+            if self._api.is_changing(
+                quote, ["last_price", "ask_price1", "bid_price1", "datetime"]
+            ):
+                changed_symbols.append(symbol)
 
-        if changed_symbols:
-            for symbol in changed_symbols:
-                quote_data = self._extract_quote(symbol)
-                if quote_data is None:
-                    continue
-                msg = json.dumps(
-                    {"type": "quote_update", "data": quote_data.model_dump()},
-                    ensure_ascii=False,
-                )
-                for q in self._ws_queues:
+        if not changed_symbols:
+            return
+
+        for symbol in changed_symbols:
+            quote_data = self._extract_quote(symbol)
+            if quote_data is None:
+                continue
+            msg = json.dumps(
+                {"type": "quote_update", "data": quote_data.model_dump()},
+                ensure_ascii=False,
+            )
+            for q in self._ws_queues:
+                try:
+                    q.put_nowait(msg)
+                except queue.Full:
                     try:
+                        q.get_nowait()
                         q.put_nowait(msg)
-                    except queue.Full:
-                        try:
-                            q.get_nowait()
-                            q.put_nowait(msg)
-                        except Exception:
-                            pass
-
-    def subscribe_quote(self, symbols: list[str]) -> tuple[list[str], list[str]]:
-        subscribed = []
-        already = []
-        with self._lock:
-            for s in symbols:
-                if s in self._quotes:
-                    already.append(s)
-                else:
-                    try:
-                        if not self.is_ready:
-                            logger.warning("TqApi not ready, cannot subscribe %s", s)
-                            continue
-                        q = self.api.get_quote(s)
-                        self._quotes[s] = q
-                        self._subscribed_symbols.add(s)
-                        subscribed.append(s)
-                        logger.info("Subscribed quote: %s", s)
-                    except Exception as e:
-                        logger.error("Subscribe quote failed for %s: %s", s, e)
-        return subscribed, already
-
-    def unsubscribe_quote(self, symbols: list[str]) -> tuple[list[str], list[str]]:
-        unsubscribed = []
-        not_subscribed = []
-        with self._lock:
-            for s in symbols:
-                if s in self._quotes:
-                    del self._quotes[s]
-                    self._subscribed_symbols.discard(s)
-                    unsubscribed.append(s)
-                    logger.info("Unsubscribed quote: %s", s)
-                else:
-                    not_subscribed.append(s)
-        return unsubscribed, not_subscribed
-
-    def get_quote(self, symbol: str) -> Optional[QuoteData]:
-        with self._lock:
-            if symbol not in self._quotes:
-                return None
-        return self._extract_quote(symbol)
-
-    def get_all_quotes(self) -> list[QuoteData]:
-        result = []
-        with self._lock:
-            symbols = list(self._quotes.keys())
-        for s in symbols:
-            q = self._extract_quote(s)
-            if q:
-                result.append(q)
-        return result
+                    except Exception:
+                        pass
 
     def _extract_quote(self, symbol: str) -> Optional[QuoteData]:
-        with self._lock:
-            quote = self._quotes.get(symbol)
+        quote = self._quotes.get(symbol)
         if quote is None:
             return None
         try:
@@ -207,71 +516,44 @@ class TqMarketEngine:
             logger.error("Extract quote failed for %s: %s", symbol, e)
             return None
 
-    def get_klines(
-        self, symbol: str, duration_seconds: int = 60, data_length: int = 200
-    ) -> Optional[pandas.DataFrame]:
-        key = f"{symbol}_{duration_seconds}_{data_length}"
-        with self._lock:
-            if key not in self._klines:
-                try:
-                    if not self.is_ready:
-                        return None
-                    df = self.api.get_kline_serial(
-                        symbol, duration_seconds, data_length=data_length
-                    )
-                    self._klines[key] = df
-                except Exception as e:
-                    logger.error("Get klines failed for %s: %s", symbol, e)
-                    return None
-            return self._klines[key]
+    # ---------- 持久化 ----------
 
-    def get_ticks(self, symbol: str, data_length: int = 200) -> Optional[pandas.DataFrame]:
-        key = f"{symbol}_{data_length}"
-        with self._lock:
-            if key not in self._ticks:
-                try:
-                    if not self.is_ready:
-                        return None
-                    df = self.api.get_tick_serial(symbol, data_length=data_length)
-                    self._ticks[key] = df
-                except Exception as e:
-                    logger.error("Get ticks failed for %s: %s", symbol, e)
-                    return None
-            return self._ticks[key]
-
-    def query_quotes(
-        self,
-        exchange_id: Optional[str] = None,
-        product_id: Optional[str] = None,
-        ins_class: Optional[str] = None,
-        expired: bool = False,
-    ) -> list[str]:
+    def _load_persisted_subscriptions(self):
+        if not PERSIST_SUBSCRIPTIONS:
+            return
         try:
-            if not self.is_ready:
-                return []
-            result = self.api.query_quotes(
-                ins_class=ins_class,
-                exchange_id=exchange_id,
-                product_id=product_id,
-                expired=expired,
-            )
-            return list(result)
+            if os.path.exists(SUBSCRIPTIONS_FILE):
+                with open(SUBSCRIPTIONS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                symbols = data.get("symbols", [])
+                if isinstance(symbols, list):
+                    for s in symbols:
+                        if isinstance(s, str):
+                            self._subscribed_symbols.add(s)
+                if self._subscribed_symbols:
+                    logger.info(
+                        "Loaded %d persisted subscriptions",
+                        len(self._subscribed_symbols),
+                    )
         except Exception as e:
-            logger.error("Query quotes failed: %s", e)
-            return []
+            logger.warning("Failed to load persisted subscriptions: %s", e)
 
-    def get_subscribed_symbols(self) -> list[str]:
-        with self._lock:
-            return list(self._subscribed_symbols)
+    def _save_persisted_subscriptions(self):
+        if not PERSIST_SUBSCRIPTIONS:
+            return
+        try:
+            data = {
+                "symbols": sorted(self._subscribed_symbols),
+                "saved_at": time.time(),
+            }
+            tmp_path = SUBSCRIPTIONS_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, SUBSCRIPTIONS_FILE)
+        except Exception as e:
+            logger.warning("Failed to save persisted subscriptions: %s", e)
 
-    def register_ws_queue(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=100)
-        self._ws_queues.append(q)
-        return q
-
-    def unregister_ws_queue(self, q: queue.Queue):
-        if q in self._ws_queues:
-            self._ws_queues.remove(q)
+    # ---------- 工具方法 ----------
 
     @staticmethod
     def _safe_float(val) -> Optional[float]:

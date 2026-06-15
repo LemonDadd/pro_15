@@ -1,6 +1,6 @@
-from typing import Optional
+from typing import Optional, Literal, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class QuoteData(BaseModel):
@@ -44,8 +44,26 @@ class KlineResponse(BaseModel):
     data: list[KlineData]
 
 
+class TickData(BaseModel):
+    datetime: Optional[str] = None
+    last_price: Optional[float] = None
+    ask_price1: Optional[float] = None
+    bid_price1: Optional[float] = None
+    highest: Optional[float] = None
+    lowest: Optional[float] = None
+    volume: Optional[float] = None
+    amount: Optional[float] = None
+    open_interest: Optional[float] = None
+
+
+class TickResponse(BaseModel):
+    symbol: str
+    data_length: int
+    data: list[TickData]
+
+
 class SubscribeRequest(BaseModel):
-    symbols: list[str]
+    symbols: list[str] = Field(..., description="要订阅的合约代码列表，单次最多 50 只")
 
 
 class SubscribeResponse(BaseModel):
@@ -68,7 +86,15 @@ class SymbolInfo(BaseModel):
 
 
 class QuerySymbolsRequest(BaseModel):
-    exchange_id: Optional[str] = None
-    product_id: Optional[str] = None
-    ins_class: Optional[str] = None
-    expired: bool = False
+    exchange_id: Optional[str] = Field(None, description="交易所代码，例如 SSE、SZSE、SHFE 等")
+    product_id: Optional[str] = Field(None, description="品种代码，例如 600000、rb 等")
+    ins_class: Optional[str] = Field(None, description="合约类型，例如 STOCK（股票）、FUTURE（期货）等")
+    expired: bool = Field(False, description="是否包含已过期合约")
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok", "degraded", "unavailable"]
+    engine_ready: bool
+    error: Optional[Literal["auth_missing", "auth_failed", "connect_timeout"]]
+    subscribed_symbols: list[str]
+    last_update_at: Optional[str] = None
