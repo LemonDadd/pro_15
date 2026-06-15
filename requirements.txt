@@ -1,0 +1,6 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+tqsdk>=3.0.0
+pandas>=2.0.0
+pydantic>=2.0.0
+websockets>=11.0
