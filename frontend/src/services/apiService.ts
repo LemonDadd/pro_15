@@ -11,10 +11,20 @@ import type {
   QuerySymbolsRequest,
 } from '../types';
 
-const baseURL = '/api';
+interface LoginResponse {
+  success: boolean;
+  token: string | null;
+  error: string | null;
+  username?: string;
+}
+
+interface AuthStatusResponse {
+  authenticated: boolean;
+  username: string | null;
+}
 
 const api = axios.create({
-  baseURL,
+  baseURL: '/api',
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json',
@@ -24,15 +34,7 @@ const api = axios.create({
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('tq_auth_token');
   if (token) {
-    try {
-      const { username, password } = JSON.parse(token);
-      if (username && password) {
-        // 将认证信息编码在自定义头中，后端可以通过中间件读取
-        config.headers['X-TQ-User'] = encodeURIComponent(username);
-      }
-    } catch {
-      // ignore
-    }
+    config.headers['Authorization'] = `Bearer ${token}`;
   }
   return config;
 });
@@ -48,6 +50,22 @@ api.interceptors.response.use(
 );
 
 export const apiService = {
+  async login(username: string, password: string): Promise<LoginResponse> {
+    const { data } = await api.post<LoginResponse>('/auth/login', {
+      username,
+      password,
+    });
+    if (data.success && data.token) {
+      localStorage.setItem('tq_auth_token', data.token);
+    }
+    return data;
+  },
+
+  async getAuthStatus(): Promise<AuthStatusResponse> {
+    const { data } = await api.get<AuthStatusResponse>('/auth/status');
+    return data;
+  },
+
   async getHealth(): Promise<HealthResponse> {
     const { data } = await api.get<HealthResponse>('/health');
     return data;

@@ -1,6 +1,13 @@
 import os
 from typing import Optional
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 
 def _get_bool(name: str, default: bool = False) -> bool:
     val = os.getenv(name, "").strip().lower()

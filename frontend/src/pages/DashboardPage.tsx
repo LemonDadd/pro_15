@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import Header from '../components/Header';
 import QuoteList from '../components/QuoteList';
 import SearchModal from '../components/SearchModal';
@@ -9,11 +9,20 @@ const DashboardPage = () => {
   const [searchOpen, setSearchOpen] = useState(false);
   const { fetchQuotes, wsStatus, quotes, subscribedSymbols } = useAppStore();
 
-  useEffect(() => {
+  const stableFetchQuotes = useCallback(() => {
     fetchQuotes();
-    const timer = setInterval(fetchQuotes, 5000);
-    return () => clearInterval(timer);
   }, [fetchQuotes]);
+
+  useEffect(() => {
+    stableFetchQuotes();
+  }, [stableFetchQuotes]);
+
+  useEffect(() => {
+    if (wsStatus === 'connected') return;
+
+    const timer = setInterval(stableFetchQuotes, 10000);
+    return () => clearInterval(timer);
+  }, [wsStatus, stableFetchQuotes]);
 
   const stats = (() => {
     let up = 0;
@@ -47,7 +56,6 @@ const DashboardPage = () => {
       <Header onSearchClick={() => setSearchOpen(true)} />
 
       <main className="pt-20 pb-8 px-6">
-        {/* 顶部统计卡片 */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
           <div className="glass rounded-xl p-4 card-hover">
             <div className="flex items-center justify-between mb-2">
@@ -101,7 +109,6 @@ const DashboardPage = () => {
           </div>
         </div>
 
-        {/* 连接状态提示 */}
         {wsStatus !== 'connected' && (
           <div className="mb-4 p-3 glass-light rounded-lg flex items-center gap-2 text-sm">
             {wsStatus === 'connecting' && (
@@ -125,7 +132,6 @@ const DashboardPage = () => {
           </div>
         )}
 
-        {/* 股票列表 */}
         <QuoteList />
       </main>
 

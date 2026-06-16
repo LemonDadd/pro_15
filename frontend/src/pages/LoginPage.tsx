@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { TrendingUp, Eye, EyeOff, AlertCircle } from 'lucide-react';
+import { TrendingUp, Eye, EyeOff, AlertCircle, Loader } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
 
 const LoginPage = () => {
@@ -13,17 +13,19 @@ const LoginPage = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [engineStarting, setEngineStarting] = useState(false);
 
   useEffect(() => {
-    if (isAuthenticated) {
+    if (isAuthenticated && !engineStarting) {
       const from = (location.state as any)?.from?.pathname || '/';
       navigate(from, { replace: true });
     }
-  }, [isAuthenticated, navigate, location]);
+  }, [isAuthenticated, navigate, location, engineStarting]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setEngineStarting(false);
 
     if (!username.trim() || !password.trim()) {
       setError('请输入账号和密码');
@@ -32,13 +34,18 @@ const LoginPage = () => {
 
     setLoading(true);
     try {
-      const success = await login(username.trim(), password.trim());
-      if (success) {
-        navigate('/', { replace: true });
+      const result = await login(username.trim(), password.trim());
+      if (result.success) {
+        if (result.engineStarting) {
+          setEngineStarting(true);
+          navigate('/', { replace: true });
+        } else {
+          navigate('/', { replace: true });
+        }
       } else {
-        setError('登录失败，请检查账号密码');
+        setError(result.error || '账号或密码错误');
       }
-    } catch (err) {
+    } catch {
       setError('登录失败，请稍后重试');
     } finally {
       setLoading(false);
@@ -47,14 +54,15 @@ const LoginPage = () => {
 
   return (
     <div className="min-h-screen bg-night-950 flex items-center justify-center relative overflow-hidden">
-      {/* 背景装饰 */}
       <div className="absolute inset-0 overflow-hidden">
         <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-cyan-500/10 rounded-full blur-3xl animate-float" />
-        <div className="absolute bottom-1/4 right-1/4 w-80 h-80 bg-up/10 rounded-full blur-3xl animate-float" style={{ animationDelay: '2s' }} />
+        <div
+          className="absolute bottom-1/4 right-1/4 w-80 h-80 bg-up/10 rounded-full blur-3xl animate-float"
+          style={{ animationDelay: '2s' }}
+        />
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-down/5 rounded-full blur-3xl" />
       </div>
 
-      {/* 网格背景 */}
       <div
         className="absolute inset-0 opacity-20"
         style={{
@@ -66,9 +74,7 @@ const LoginPage = () => {
         }}
       />
 
-      {/* 登录卡片 */}
       <div className="relative z-10 w-full max-w-md px-4">
-        {/* Logo */}
         <div className="text-center mb-8">
           <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-br from-cyan-400 to-up mb-4 shadow-lg shadow-cyan-500/20">
             <TrendingUp className="w-8 h-8 text-white" />
@@ -77,7 +83,6 @@ const LoginPage = () => {
           <p className="text-gray-400 text-sm">专业的股票期货实时行情平台</p>
         </div>
 
-        {/* 登录表单 */}
         <div className="glass rounded-2xl p-8 shadow-2xl">
           <h2 className="text-xl font-semibold text-white mb-6 text-center">账号登录</h2>
 
@@ -88,8 +93,14 @@ const LoginPage = () => {
             </div>
           )}
 
+          {engineStarting && (
+            <div className="mb-4 p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg flex items-center gap-2 text-amber-400 text-sm">
+              <Loader className="w-4 h-4 flex-shrink-0 animate-spin" />
+              <span>引擎启动中</span>
+            </div>
+          )}
+
           <form onSubmit={handleSubmit} className="space-y-5">
-            {/* 账号 */}
             <div>
               <label className="block text-sm text-gray-400 mb-2">TqSdk 账号</label>
               <input
@@ -102,7 +113,6 @@ const LoginPage = () => {
               />
             </div>
 
-            {/* 密码 */}
             <div>
               <label className="block text-sm text-gray-400 mb-2">密码</label>
               <div className="relative">
@@ -119,12 +129,15 @@ const LoginPage = () => {
                   onClick={() => setShowPassword(!showPassword)}
                   className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white transition-colors"
                 >
-                  {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                  {showPassword ? (
+                    <EyeOff className="w-5 h-5" />
+                  ) : (
+                    <Eye className="w-5 h-5" />
+                  )}
                 </button>
               </div>
             </div>
 
-            {/* 登录按钮 */}
             <button
               type="submit"
               disabled={loading}
@@ -133,8 +146,20 @@ const LoginPage = () => {
               {loading ? (
                 <span className="flex items-center justify-center gap-2">
                   <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    <circle
+                      className="opacity-25"
+                      cx="12"
+                      cy="12"
+                      r="10"
+                      stroke="currentColor"
+                      strokeWidth="4"
+                      fill="none"
+                    />
+                    <path
+                      className="opacity-75"
+                      fill="currentColor"
+                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                    />
                   </svg>
                   登录中...
                 </span>
@@ -144,13 +169,11 @@ const LoginPage = () => {
             </button>
           </form>
 
-          {/* 提示 */}
           <p className="mt-6 text-center text-xs text-gray-500">
             登录即表示您同意使用 TqSdk 服务
           </p>
         </div>
 
-        {/* 底部 */}
         <p className="text-center text-xs text-gray-600 mt-6">
           基于 TqSdk · 专业行情数据服务
         </p>

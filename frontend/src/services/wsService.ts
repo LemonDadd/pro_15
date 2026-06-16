@@ -13,8 +13,11 @@ class WsService {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private url = '';
+  private token = '';
 
-  connect(url: string = '/ws/quotes') {
+  connect(token: string, url: string = '/ws/quotes') {
+    this.token = token;
+
     if (this.ws && (this.status === 'connected' || this.status === 'connecting')) {
       return;
     }
@@ -25,8 +28,8 @@ class WsService {
     try {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = url.startsWith('ws')
-        ? url
-        : `${protocol}//${window.location.host}${url}`;
+        ? `${url}?token=${encodeURIComponent(token)}`
+        : `${protocol}//${window.location.host}${url}?token=${encodeURIComponent(token)}`;
 
       this.ws = new WebSocket(wsUrl);
 
@@ -151,7 +154,9 @@ class WsService {
 
     this.reconnectTimer = setTimeout(() => {
       console.log(`Reconnecting... attempt ${this.reconnectAttempts}`);
-      this.connect(this.url);
+      if (this.token) {
+        this.connect(this.token, this.url);
+      }
     }, delay);
   }
 

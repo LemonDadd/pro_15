@@ -4,86 +4,101 @@ import type { QuoteData, WsStatus } from '../types';
 import { apiService } from '../services/apiService';
 import { wsService } from '../services/wsService';
 
+interface LoginResult {
+  success: boolean;
+  error?: string;
+  engineStarting?: boolean;
+}
+
 interface AppState {
-  // Auth
   isAuthenticated: boolean;
   username: string | null;
-
-  // Quotes
+  token: string | null;
   quotes: Record<string, QuoteData>;
   subscribedSymbols: string[];
-
-  // WS status
   wsStatus: WsStatus;
-
-  // Current
   currentSymbol: string | null;
+  engineReady: boolean;
+  engineError: string | null;
 
-  // Auth actions
-  login: (username: string, password: string) => Promise<boolean>;
+  login: (username: string, password: string) => Promise<LoginResult>;
   logout: () => void;
-
-  // Quote actions
   fetchQuotes: () => Promise<void>;
   subscribe: (symbols: string[]) => Promise<void>;
   unsubscribe: (symbols: string[]) => Promise<void>;
   updateQuote: (quote: QuoteData) => void;
-
-  // Current
   setCurrentSymbol: (symbol: string) => void;
-
-  // WS
+  setEngineReady: (ready: boolean) => void;
+  setEngineError: (error: string | null) => void;
   connectWs: () => void;
   disconnectWs: () => void;
-  setWsStatus: (status: WsStatus) => void;
+  checkAuthStatus: () => Promise<void>;
 }
+
+let wsUnsubMessage: (() => void) | null = null;
+let wsUnsubStatus: (() => void) | null = null;
 
 export const useAppStore = create<AppState>()(
   persist(
     (set, get) => ({
       isAuthenticated: false,
       username: null,
+      token: null,
       quotes: {},
       subscribedSymbols: [],
       wsStatus: 'disconnected',
       currentSymbol: null,
+      engineReady: false,
+      engineError: null,
 
-      login: async (username: string, password: string): Promise<boolean> => {
+      login: async (username: string, password: string): Promise<LoginResult> => {
         try {
-          // 保存认证信息到 localStorage（模拟登录）
-          localStorage.setItem(
-            'tq_auth_token',
-            JSON.stringify({ username, password })
-          );
+          const result = await apiService.login(username, password);
 
-          // 通过健康检查验证引擎是否可用
-          const health = await apiService.getHealth();
-
-          if (health.status === 'unavailable' && health.error === 'auth_missing') {
-            // 后端未配置鉴权，前端登录成功但需要等后端
-            set({ isAuthenticated: true, username });
-            return true;
+          if (!result.success) {
+            localStorage.removeItem('tq_auth_token');
+            return { success: false, error: result.error || '账号或密码错误' };
           }
 
-          if (health.engine_ready) {
-            set({ isAuthenticated: true, username });
-            // 连接 WebSocket
-            get().connectWs();
-            // 获取已订阅列表
+          const token = result.token;
+          if (!token) {
+            return { success: false, error: '登录失败，未获取到 token' };
+          }
+
+          set({
+            isAuthenticated: true,
+            username,
+            token,
+            engineReady: false,
+            engineError: result.error || null,
+          });
+
+          get().connectWs();
+
+          let engineStarting = false;
+          try {
+            const health = await apiService.getHealth();
+            set({
+              engineReady: health.engine_ready,
+              engineError: health.error,
+            });
+            if (!health.engine_ready) {
+              engineStarting = true;
+            }
             await get().fetchQuotes();
-            return true;
+          } catch {
+            engineStarting = true;
           }
 
-          // 引擎还没准备好，也算登录成功，让用户进入页面看加载状态
-          set({ isAuthenticated: true, username });
-          get().connectWs();
-          return true;
-        } catch (error) {
-          console.error('Login error:', error);
-          // 即使请求失败，也让用户进入（后端可能还没启动）
-          set({ isAuthenticated: true, username });
-          get().connectWs();
-          return true;
+          if (result.error) {
+            engineStarting = true;
+          }
+
+          return { success: true, engineStarting };
+        } catch (error: any) {
+          localStorage.removeItem('tq_auth_token');
+          const msg = error?.response?.data?.detail || error?.response?.data?.error || error?.message;
+          return { success: false, error: msg || '登录失败，请稍后重试' };
         }
       },
 
@@ -93,10 +108,25 @@ export const useAppStore = create<AppState>()(
         set({
           isAuthenticated: false,
           username: null,
+          token: null,
           quotes: {},
           subscribedSymbols: [],
           currentSymbol: null,
+          engineReady: false,
+          engineError: null,
         });
+      },
+
+      checkAuthStatus: async () => {
+        try {
+          const status = await apiService.getAuthStatus();
+          set({
+            engineReady: status.engine_ready,
+            engineError: status.error || null,
+          });
+        } catch (error) {
+          console.error('Check auth status error:', error);
+        }
       },
 
       fetchQuotes: async () => {
@@ -116,11 +146,15 @@ export const useAppStore = create<AppState>()(
       subscribe: async (symbols: string[]) => {
         try {
           const result = await apiService.subscribe(symbols);
-          const allSymbols = [...new Set([...get().subscribedSymbols, ...result.subscribed, ...result.already_subscribed])];
+          const allSymbols = [
+            ...new Set([
+              ...get().subscribedSymbols,
+              ...result.subscribed,
+              ...result.already_subscribed,
+            ]),
+          ];
           set({ subscribedSymbols: allSymbols });
-          // WS 也发送订阅
           wsService.subscribe(symbols);
-          // 重新获取行情
           await get().fetchQuotes();
         } catch (error) {
           console.error('Subscribe error:', error);
@@ -139,7 +173,6 @@ export const useAppStore = create<AppState>()(
             delete newQuotes[s];
           });
           set({ subscribedSymbols: remaining, quotes: newQuotes });
-          // WS 也取消订阅
           wsService.unsubscribe(symbols);
         } catch (error) {
           console.error('Unsubscribe error:', error);
@@ -160,24 +193,69 @@ export const useAppStore = create<AppState>()(
         set({ currentSymbol: symbol });
       },
 
+      setEngineReady: (ready: boolean) => {
+        set({ engineReady: ready });
+      },
+
+      setEngineError: (error: string | null) => {
+        set({ engineError: error });
+      },
+
       connectWs: () => {
-        wsService.connect();
-        wsService.onStatus((status) => {
+        const token = get().token;
+        if (!token) {
+          console.error('No token available for WebSocket connection');
+          return;
+        }
+
+        if (wsUnsubMessage) {
+          wsUnsubMessage();
+        }
+        if (wsUnsubStatus) {
+          wsUnsubStatus();
+        }
+
+        wsService.connect(token);
+
+        wsUnsubStatus = wsService.onStatus((status) => {
           set({ wsStatus: status });
+          if (status === 'connected') {
+            const symbols = get().subscribedSymbols;
+            if (symbols.length > 0) {
+              wsService.subscribe(symbols);
+            }
+          }
         });
-        wsService.onMessage((message) => {
+
+        wsUnsubMessage = wsService.onMessage((message) => {
           if (message.type === 'quote_update' && message.data) {
             get().updateQuote(message.data);
+          }
+          if (message.type === 'subscribe_result') {
+            const newSymbols = [
+              ...(message.subscribed || []),
+              ...(message.already_subscribed || []),
+            ];
+            if (newSymbols.length > 0) {
+              const allSymbols = [
+                ...new Set([...get().subscribedSymbols, ...newSymbols]),
+              ];
+              set({ subscribedSymbols: allSymbols });
+            }
           }
         });
       },
 
       disconnectWs: () => {
+        if (wsUnsubMessage) {
+          wsUnsubMessage();
+          wsUnsubMessage = null;
+        }
+        if (wsUnsubStatus) {
+          wsUnsubStatus();
+          wsUnsubStatus = null;
+        }
         wsService.disconnect();
-      },
-
-      setWsStatus: (status: WsStatus) => {
-        set({ wsStatus: status });
       },
     }),
     {
@@ -185,6 +263,7 @@ export const useAppStore = create<AppState>()(
       partialize: (state) => ({
         isAuthenticated: state.isAuthenticated,
         username: state.username,
+        token: state.token,
         currentSymbol: state.currentSymbol,
       }),
     }

@@ -11,18 +11,15 @@ import pandas
 from tqsdk import TqApi, TqAuth
 
 from app.config import (
-    API_KEY,
     DEFAULT_STOCK_SYMBOLS,
     MAX_TOTAL_SUBSCRIPTIONS,
     MAX_WS_QUEUE_SIZE,
     PERSIST_SUBSCRIPTIONS,
     STARTUP_TIMEOUT,
     SUBSCRIPTIONS_FILE,
-    TQ_AUTH_PASSWORD,
-    TQ_AUTH_USER,
     UPDATE_LOOP_DEADLINE,
 )
-from app.models import QuoteData, SymbolInfo, TickData
+from app.models import QuoteData, SymbolInfo
 
 logger = logging.getLogger(__name__)
 
@@ -56,16 +53,9 @@ class Command:
 
 
 class TqMarketEngine:
-    """
-    基于 TqSdk 的行情引擎。
-
-    设计原则：
-    - 单线程 TqApi：所有 TqSdk API 调用都在 _run_loop 工作线程执行
-    - 指令队列：外部线程通过 _cmd_queue 提交请求，Event+结果槽 回传
-    - 自动重连：TqSdk 异常断线后自动重建连接并恢复订阅
-    """
-
-    def __init__(self):
+    def __init__(self, username: str, password: str):
+        self._username = username
+        self._password = password
         self._api: Optional[TqApi] = None
         self._quotes: dict[str, object] = {}
         self._klines: dict[str, pandas.DataFrame] = {}
@@ -80,9 +70,6 @@ class TqMarketEngine:
         self._last_error: Optional[str] = None
         self._last_update_at: Optional[float] = None
         self._consecutive_errors = 0
-        self._reconnect_delay = 0
-
-    # ---------- 公共属性 ----------
 
     @property
     def is_ready(self) -> bool:
@@ -96,8 +83,11 @@ class TqMarketEngine:
     def last_update_at(self) -> Optional[float]:
         return self._last_update_at
 
+    @property
+    def username(self) -> str:
+        return self._username
+
     def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
-        """等待引擎就绪，返回是否成功。"""
         if timeout is None:
             timeout = STARTUP_TIMEOUT
         deadline = time.time() + timeout
@@ -112,8 +102,6 @@ class TqMarketEngine:
             self._startup_event.wait(timeout=min(remaining, 1.0))
         return self.is_ready
 
-    # ---------- 生命周期 ----------
-
     def start(self):
         if self._running:
             return
@@ -124,7 +112,7 @@ class TqMarketEngine:
         self._load_persisted_subscriptions()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        logger.info("TqMarketEngine starting...")
+        logger.info("TqMarketEngine starting for user: %s", self._username)
 
     def stop(self):
         self._save_persisted_subscriptions()
@@ -142,10 +130,7 @@ class TqMarketEngine:
         self._last_error = None
         logger.info("TqMarketEngine stopped")
 
-    # ---------- 指令队列：提交请求 ----------
-
     def _submit(self, action: str, params: Optional[dict] = None, timeout: float = 30.0) -> Any:
-        """向工作线程提交指令并等待结果。"""
         if not self._running:
             raise RuntimeError("TqMarketEngine is not running")
         cmd = Command(action=action, params=params or {})
@@ -156,8 +141,6 @@ class TqMarketEngine:
         if cmd.error:
             raise RuntimeError(cmd.error)
         return cmd.result
-
-    # ---------- 公开 API（供 HTTP/WS 调用）----------
 
     def subscribe_quote(self, symbols: list[str]) -> tuple[list[str], list[str]]:
         return self._submit("subscribe", {"symbols": symbols})
@@ -215,23 +198,22 @@ class TqMarketEngine:
         if q in self._ws_queues:
             self._ws_queues.remove(q)
 
-    # ---------- 工作线程主循环 ----------
-
     def _run_loop(self):
         while self._running:
             try:
                 self._connect_and_run()
             except Exception as e:
+                err_str = str(e).lower()
+                if "认证" in str(e) or "权限" in str(e) or "403" in str(e) or "密码" in str(e) or "auth" in err_str:
+                    self._last_error = "auth_failed"
+                    self._startup_event.set()
+                    logger.error("TqApi auth failed: %s", e)
+                    return
                 self._consecutive_errors += 1
                 self._last_error = "connect_timeout" if self._consecutive_errors >= 3 else None
-                logger.error(
-                    "TqApi loop error (consecutive=%d): %s",
-                    self._consecutive_errors,
-                    e,
-                )
+                logger.error("TqApi loop error (consecutive=%d): %s", self._consecutive_errors, e)
                 if self._running:
                     delay = min(2 ** self._consecutive_errors, 30)
-                    self._reconnect_delay = delay
                     logger.info("Reconnecting in %ds...", delay)
                     time.sleep(delay)
             finally:
@@ -243,15 +225,14 @@ class TqMarketEngine:
                     self._api = None
 
     def _connect_and_run(self):
-        """创建 TqApi 连接并进入 wait_update 循环。"""
-        if not TQ_AUTH_USER or not TQ_AUTH_PASSWORD:
+        if not self._username or not self._password:
             self._last_error = "auth_missing"
             self._startup_event.set()
             logger.error("Auth credentials missing")
             time.sleep(5)
             return
 
-        auth = TqAuth(TQ_AUTH_USER, TQ_AUTH_PASSWORD)
+        auth = TqAuth(self._username, self._password)
         try:
             self._api = TqApi(auth=auth)
         except Exception as e:
@@ -261,7 +242,6 @@ class TqMarketEngine:
             raise
 
         try:
-            # 恢复订阅
             symbols_to_subscribe = list(self._subscribed_symbols) if self._subscribed_symbols else []
             if not symbols_to_subscribe:
                 symbols_to_subscribe = list(DEFAULT_STOCK_SYMBOLS)
@@ -277,13 +257,13 @@ class TqMarketEngine:
             if symbols_to_subscribe:
                 logger.info("Restored %d subscriptions", len(self._subscribed_symbols))
 
+            self._api.wait_update(deadline=time.time() + 5)
+
             self._last_error = None
             self._consecutive_errors = 0
-            self._reconnect_delay = 0
             self._startup_event.set()
             logger.info("TqApi connected, subscriptions: %d", len(self._subscribed_symbols))
 
-            # 主循环
             while self._running:
                 self._process_pending_commands()
                 deadline_ts = time.time() + UPDATE_LOOP_DEADLINE
@@ -299,7 +279,6 @@ class TqMarketEngine:
             self._api = None
 
     def _process_pending_commands(self):
-        """处理队列中等待的指令（非阻塞，每次最多处理一批）。"""
         processed = 0
         while processed < 20:
             try:
@@ -314,7 +293,6 @@ class TqMarketEngine:
             processed += 1
 
     def _handle_command(self, cmd: Command):
-        """在工作线程中执行具体指令。"""
         if self._api is None:
             cmd.set_error("api_not_ready")
             return
@@ -323,18 +301,15 @@ class TqMarketEngine:
         params = cmd.params
 
         if action == "subscribe":
-            symbols = params.get("symbols", [])
-            result = self._cmd_subscribe(symbols)
+            result = self._cmd_subscribe(params.get("symbols", []))
             cmd.set_result(result)
 
         elif action == "unsubscribe":
-            symbols = params.get("symbols", [])
-            result = self._cmd_unsubscribe(symbols)
+            result = self._cmd_unsubscribe(params.get("symbols", []))
             cmd.set_result(result)
 
         elif action == "get_quote":
-            symbol = params.get("symbol", "")
-            result = self._extract_quote(symbol)
+            result = self._extract_quote(params.get("symbol", ""))
             cmd.set_result(result)
 
         elif action == "get_all_quotes":
@@ -399,8 +374,7 @@ class TqMarketEngine:
                         return
                     except Exception as e:
                         logger.warning("query_symbol_info failed, falling back: %s", e)
-                infos = [SymbolInfo(symbol=s) for s in symbol_list]
-                cmd.set_result(infos)
+                cmd.set_result([SymbolInfo(symbol=s) for s in symbol_list])
             except Exception as e:
                 cmd.set_error(f"query_failed: {e}")
 
@@ -438,7 +412,6 @@ class TqMarketEngine:
                 self._subscribed_symbols.discard(s)
                 unsubscribed.append(s)
                 logger.info("Unsubscribed: %s", s)
-                # 清理相关缓存
                 keys_to_del = [k for k in self._klines if k.startswith(f"{s}_")]
                 for k in keys_to_del:
                     del self._klines[k]
@@ -451,14 +424,10 @@ class TqMarketEngine:
             self._save_persisted_subscriptions()
         return unsubscribed, not_subscribed
 
-    # ---------- 行情更新推送 ----------
-
     def _on_update(self):
         changed_symbols = []
         for symbol, quote in self._quotes.items():
-            if self._api.is_changing(
-                quote, ["last_price", "ask_price1", "bid_price1", "datetime"]
-            ):
+            if self._api.is_changing(quote, ["last_price", "ask_price1", "bid_price1", "datetime"]):
                 changed_symbols.append(symbol)
 
         if not changed_symbols:
@@ -493,9 +462,25 @@ class TqMarketEngine:
                 instrument_name=getattr(quote, "instrument_name", None),
                 last_price=self._safe_float(getattr(quote, "last_price", None)),
                 ask_price1=self._safe_float(getattr(quote, "ask_price1", None)),
+                ask_price2=self._safe_float(getattr(quote, "ask_price2", None)),
+                ask_price3=self._safe_float(getattr(quote, "ask_price3", None)),
+                ask_price4=self._safe_float(getattr(quote, "ask_price4", None)),
+                ask_price5=self._safe_float(getattr(quote, "ask_price5", None)),
                 ask_volume1=self._safe_int(getattr(quote, "ask_volume1", None)),
+                ask_volume2=self._safe_int(getattr(quote, "ask_volume2", None)),
+                ask_volume3=self._safe_int(getattr(quote, "ask_volume3", None)),
+                ask_volume4=self._safe_int(getattr(quote, "ask_volume4", None)),
+                ask_volume5=self._safe_int(getattr(quote, "ask_volume5", None)),
                 bid_price1=self._safe_float(getattr(quote, "bid_price1", None)),
+                bid_price2=self._safe_float(getattr(quote, "bid_price2", None)),
+                bid_price3=self._safe_float(getattr(quote, "bid_price3", None)),
+                bid_price4=self._safe_float(getattr(quote, "bid_price4", None)),
+                bid_price5=self._safe_float(getattr(quote, "bid_price5", None)),
                 bid_volume1=self._safe_int(getattr(quote, "bid_volume1", None)),
+                bid_volume2=self._safe_int(getattr(quote, "bid_volume2", None)),
+                bid_volume3=self._safe_int(getattr(quote, "bid_volume3", None)),
+                bid_volume4=self._safe_int(getattr(quote, "bid_volume4", None)),
+                bid_volume5=self._safe_int(getattr(quote, "bid_volume5", None)),
                 open=self._safe_float(getattr(quote, "open", None)),
                 high=self._safe_float(getattr(quote, "highest", None)),
                 low=self._safe_float(getattr(quote, "lowest", None)),
@@ -505,9 +490,7 @@ class TqMarketEngine:
                 amount=self._safe_float(getattr(quote, "amount", None)),
                 open_interest=self._safe_float(getattr(quote, "open_interest", None)),
                 price_tick=self._safe_float(getattr(quote, "price_tick", None)),
-                volume_multiple=self._safe_float(
-                    getattr(quote, "volume_multiple", None)
-                ),
+                volume_multiple=self._safe_float(getattr(quote, "volume_multiple", None)),
                 highest=self._safe_float(getattr(quote, "highest", None)),
                 lowest=self._safe_float(getattr(quote, "lowest", None)),
                 expired=getattr(quote, "expired", None),
@@ -515,8 +498,6 @@ class TqMarketEngine:
         except Exception as e:
             logger.error("Extract quote failed for %s: %s", symbol, e)
             return None
-
-    # ---------- 持久化 ----------
 
     def _load_persisted_subscriptions(self):
         if not PERSIST_SUBSCRIPTIONS:
@@ -531,10 +512,7 @@ class TqMarketEngine:
                         if isinstance(s, str):
                             self._subscribed_symbols.add(s)
                 if self._subscribed_symbols:
-                    logger.info(
-                        "Loaded %d persisted subscriptions",
-                        len(self._subscribed_symbols),
-                    )
+                    logger.info("Loaded %d persisted subscriptions", len(self._subscribed_symbols))
         except Exception as e:
             logger.warning("Failed to load persisted subscriptions: %s", e)
 
@@ -542,18 +520,13 @@ class TqMarketEngine:
         if not PERSIST_SUBSCRIPTIONS:
             return
         try:
-            data = {
-                "symbols": sorted(self._subscribed_symbols),
-                "saved_at": time.time(),
-            }
+            data = {"symbols": sorted(self._subscribed_symbols), "saved_at": time.time()}
             tmp_path = SUBSCRIPTIONS_FILE + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, SUBSCRIPTIONS_FILE)
         except Exception as e:
             logger.warning("Failed to save persisted subscriptions: %s", e)
-
-    # ---------- 工具方法 ----------
 
     @staticmethod
     def _safe_float(val) -> Optional[float]:
