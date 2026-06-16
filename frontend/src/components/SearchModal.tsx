@@ -31,19 +31,52 @@ const SearchModal = ({ isOpen, onClose }: SearchModalProps) => {
   const { subscribe, subscribedSymbols } = useAppStore();
 
   const doSearch = useCallback(async (value: string) => {
-    const match = value.match(/^(SSE|SZSE|DCE|SHFE|CZCE|INE|GFEX)\./i);
-    if (!match) {
-      setSearchResults([]);
-      return;
-    }
-    const exchangeId = match[1].toUpperCase();
+    const trimmed = value.trim().toUpperCase();
     setSearching(true);
     try {
-      const results = await apiService.querySymbols({ exchange_id: exchangeId });
-      const filtered = results.filter(
-        (r) => r.symbol.toLowerCase().startsWith(value.toLowerCase())
-      );
-      setSearchResults(filtered.slice(0, 50));
+      let results: SymbolInfo[] = [];
+      let searchQuery = trimmed;
+
+      const fullMatch = trimmed.match(/^(SSE|SZSE|DCE|SHFE|CZCE|INE|GFEX)\.(\w+)/i);
+      const numberMatch = trimmed.match(/^(\d{6})$/);
+
+      if (numberMatch) {
+        const code = numberMatch[1];
+        if (code.startsWith('6') || code.startsWith('9')) {
+          searchQuery = `SSE.${code}`;
+        } else if (code.startsWith('0') || code.startsWith('3')) {
+          searchQuery = `SZSE.${code}`;
+        }
+      }
+
+      const newFullMatch = searchQuery.match(/^(SSE|SZSE|DCE|SHFE|CZCE|INE|GFEX)\.(\w+)/i);
+      if (newFullMatch) {
+        const exchangeId = newFullMatch[1].toUpperCase();
+        results = await apiService.querySymbols({
+          exchange_id: exchangeId,
+          ins_class: 'STOCK',
+        });
+        const filtered = results.filter(
+          (r) => r.symbol.toLowerCase().startsWith(searchQuery.toLowerCase())
+        );
+        setSearchResults(filtered.slice(0, 50));
+      } else {
+        const sseResults = await apiService.querySymbols({
+          exchange_id: 'SSE',
+          ins_class: 'STOCK',
+        });
+        const szseResults = await apiService.querySymbols({
+          exchange_id: 'SZSE',
+          ins_class: 'STOCK',
+        });
+        const allResults = [...sseResults, ...szseResults];
+        const filtered = allResults.filter((r) => {
+          const symbolMatch = r.symbol.toLowerCase().includes(trimmed.toLowerCase());
+          const nameMatch = r.instrument_name?.includes(trimmed) || r.instrument_name?.includes(value);
+          return symbolMatch || nameMatch;
+        });
+        setSearchResults(filtered.slice(0, 50));
+      }
     } catch {
       setSearchResults([]);
     } finally {
@@ -115,7 +148,17 @@ const SearchModal = ({ isOpen, onClose }: SearchModalProps) => {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    handleSubscribe(inputValue);
+    let symbol = inputValue.trim();
+    const numberMatch = symbol.match(/^(\d{6})$/);
+    if (numberMatch) {
+      const code = numberMatch[1];
+      if (code.startsWith('6') || code.startsWith('9')) {
+        symbol = `SSE.${code}`;
+      } else if (code.startsWith('0') || code.startsWith('3')) {
+        symbol = `SZSE.${code}`;
+      }
+    }
+    handleSubscribe(symbol);
   };
 
   const handleQuickAdd = (symbol: string) => {
@@ -140,7 +183,7 @@ const SearchModal = ({ isOpen, onClose }: SearchModalProps) => {
               type="text"
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
-              placeholder="输入合约代码订阅，如 SSE.600000"
+              placeholder="输入代码 600519、名称 贵州茅台 或 SSE.600519"
               className="flex-1 bg-transparent text-white placeholder-gray-500 outline-none text-lg"
             />
             {subscribing && (
@@ -293,7 +336,7 @@ const SearchModal = ({ isOpen, onClose }: SearchModalProps) => {
         )}
 
         <div className="px-5 py-2 border-t border-night-600/50 flex items-center justify-between text-xs text-gray-500">
-          <span>输入完整合约代码后点击订阅或按 Enter</span>
+          <span>输入代码 600519、名称或完整代码后点击订阅或按 Enter</span>
           <span>按 ESC 关闭</span>
         </div>
       </div>

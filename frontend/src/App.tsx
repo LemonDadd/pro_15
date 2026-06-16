@@ -18,12 +18,17 @@ const ProtectedRoute = ({ children }: { children: React.ReactNode }) => {
 };
 
 const AppRoutes = () => {
-  const { isAuthenticated, token, connectWs, wsStatus, engineReady, setEngineReady, setEngineError, fetchQuotes } = useAppStore();
+  const { isAuthenticated, token, wsStatus, connectWs, engineReady, setEngineReady, setEngineError, fetchQuotes } = useAppStore();
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wsConnectedRef = useRef(false);
 
   useEffect(() => {
-    if (isAuthenticated && token && wsStatus === 'disconnected') {
+    if (isAuthenticated && token && !wsConnectedRef.current && wsStatus === 'disconnected') {
+      wsConnectedRef.current = true;
       connectWs();
+    }
+    if (!isAuthenticated) {
+      wsConnectedRef.current = false;
     }
   }, [isAuthenticated, token, wsStatus, connectWs]);
 

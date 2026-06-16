@@ -185,13 +185,8 @@ async def login(req: LoginRequest):
     try:
         engine = _get_or_create_engine(req.username.strip(), req.password.strip())
 
-        for i in range(3):
+        for i in range(6):
             ready = await asyncio.to_thread(engine.wait_until_ready, timeout=10.0)
-
-            if ready:
-                token = _make_token(req.username.strip(), req.password.strip())
-                logger.info("Login success for user: %s", req.username)
-                return LoginResponse(success=True, token=token)
 
             err = engine.last_error
             if err == "auth_failed":
@@ -201,14 +196,27 @@ async def login(req: LoginRequest):
                 _cleanup_engine()
                 return LoginResponse(success=False, error="凭证缺失")
 
+            if ready and err is None:
+                token = _make_token(req.username.strip(), req.password.strip())
+                logger.info("Login success for user: %s", req.username)
+                return LoginResponse(success=True, token=token)
+
             logger.info("Login attempt %d: engine not ready yet, error=%s", i + 1, err)
 
-        if engine.is_ready:
+        if engine.is_ready and engine.last_error is None:
             token = _make_token(req.username.strip(), req.password.strip())
             return LoginResponse(success=True, token=token)
 
-        token = _make_token(req.username.strip(), req.password.strip())
-        return LoginResponse(success=True, token=token, error="引擎启动中，请稍候")
+        err = engine.last_error
+        if err == "auth_failed":
+            _cleanup_engine()
+            return LoginResponse(success=False, error="账号或密码错误")
+        elif err == "auth_missing":
+            _cleanup_engine()
+            return LoginResponse(success=False, error="凭证缺失")
+        else:
+            _cleanup_engine()
+            return LoginResponse(success=False, error=err or "引擎连接超时，请稍后重试")
     except Exception as e:
         logger.error("Login exception: %s", e)
         return LoginResponse(success=False, error=f"登录失败: {str(e)}")
